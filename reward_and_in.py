@@ -1342,19 +1342,20 @@ class RewardCmd(commands.Cog):
     async def admAddAttendanceCmd(
             self,
             interaction: discord.Interaction,
-            member: discord.Member,
             date_jst: str,
+            member: Optional[discord.Member] = None,
             duration_sec: Optional[int] = 180,
     ) -> None:
         """
-        指定日に“通話 180 秒”に満たない場合のみ補填する管理者コマンド
+        指定日に“通話 180 秒”に満たない場合のみ補填する管理者コマンド。
+        member を指定しない場合、対象ロールを持つ全メンバーを補填します。
 
         Parameters
         ----------
-        member : discord.Member
-            対象ユーザー
         date_jst : str
             対象日 (YYYY-MM-DD, JST)
+        member : discord.Member | None, default None
+            対象ユーザー。None の場合は全員対象
         duration_sec : int | None, default 180
             追加する通話秒数。None なら「不足分ぴったり」を自動計算
         """
@@ -1382,47 +1383,22 @@ class RewardCmd(commands.Cog):
         start_utc = start_jst.astimezone(TimeMgr.UTC)
         end_utc = end_jst.astimezone(TimeMgr.UTC)
 
-        # ---------- 既存通話秒数を集計 ----------
-        async with self.bot.db_lock:
-            rows = await DBH.fetchAll(
-                self.bot.db,
-                """
-                SELECT session_start, session_end
-                FROM voice_session_logs_reward
-                WHERE user_id = ?
-                  AND session_end > ?
-                  AND session_start < ?
-                """,
-                (member.id, Util.dtStr(start_utc), Util.dtStr(end_utc)),
+        # ---------- 対象メンバー取得 ----------
+        if member is not None:
+            target_members = [member]
+        else:
+            role_ids = set(
+                MALE_ROLES
+                + FEMALE_ROLES
+                + [EXTRA_ATTEND_MALE_ROLE_ID, EXTRA_ATTEND_FEMALE_ROLE_ID]
             )
-
-        existed_sec = 0.0
-        for r in rows:
-            st = Util.parseUTC(r["session_start"]).astimezone(TimeMgr.JST)
-            ed = Util.parseUTC(r["session_end"]).astimezone(TimeMgr.JST)
-            existed_sec += max(
-                0.0,
-                (min(ed, end_jst) - max(st, start_jst)).total_seconds(),
-            )
-
-        if existed_sec >= 180:
-            await interaction.followup.send(
-                f"{member.mention} は {tgt_date} に既に {int(existed_sec)} 秒通話しています。補填は不要です。",
-                ephemeral=True,
-            )
-            return
-
-        # ---------- 補填秒数を決定 ----------
-        need_sec = 180 - int(existed_sec)
-        insert_sec = need_sec if duration_sec is None else max(duration_sec, need_sec)
+            target_members = [
+                m
+                for m in guild.members
+                if (not m.bot) and any(r.id in role_ids for r in m.roles)
+            ]
 
         # ---------- ダミーセッションを挿入 ----------
-        sess_start_jst = datetime.combine(tgt_date, time(12, 0), tzinfo=TimeMgr.JST)
-        sess_end_jst = sess_start_jst + timedelta(seconds=insert_sec)
-        sess_start_utc = sess_start_jst.astimezone(TimeMgr.UTC)
-        sess_end_utc = sess_end_jst.astimezone(TimeMgr.UTC)
-
-        # channel_id はリワード VC の先頭を流用
         if REWARD_VC_CHANNELS:
             channel_id = REWARD_VC_CHANNELS[0]
         elif TARGET_VC_CHANNELS:
@@ -1431,35 +1407,78 @@ class RewardCmd(commands.Cog):
             await interaction.followup.send("トラッキング対象 VC が設定されていません。", ephemeral=True)
             return
 
-        try:
-            await DBH.execQuery(
-                self.bot.db,
-                self.bot.db_lock,
-                """
-                INSERT INTO voice_session_logs_reward
-                    (user_id, channel_id, session_start, session_end, duration)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    member.id,
-                    channel_id,
-                    Util.dtStr(sess_start_utc),
-                    Util.dtStr(sess_end_utc),
-                    insert_sec,
-                ),
-            )
-            await interaction.followup.send(
-                f"✅ {member.mention} の {tgt_date} を {insert_sec} 秒分補填しました "
-                f"(既存 {int(existed_sec)}s → 合計 {int(existed_sec) + insert_sec}s)。",
-                ephemeral=True,
-            )
-            logging.info(
-                f"[adm_add_attendance] uid={member.id} {tgt_date=} "
-                f"existing={int(existed_sec)}s + {insert_sec}s"
-            )
-        except Exception:
-            logging.exception("Failed to insert dummy attendance session.")
-            await interaction.followup.send("DB への書き込みに失敗しました。", ephemeral=True)
+        success = 0
+        for mem in target_members:
+            async with self.bot.db_lock:
+                rows = await DBH.fetchAll(
+                    self.bot.db,
+                    """
+                    SELECT session_start, session_end
+                    FROM voice_session_logs_reward
+                    WHERE user_id = ?
+                      AND session_end > ?
+                      AND session_start < ?
+                    """,
+                    (mem.id, Util.dtStr(start_utc), Util.dtStr(end_utc)),
+                )
+
+            existed_sec = 0.0
+            for r in rows:
+                st = Util.parseUTC(r["session_start"]).astimezone(TimeMgr.JST)
+                ed = Util.parseUTC(r["session_end"]).astimezone(TimeMgr.JST)
+                existed_sec += max(
+                    0.0,
+                    (min(ed, end_jst) - max(st, start_jst)).total_seconds(),
+                )
+
+            if existed_sec >= 180:
+                continue
+
+            need_sec = 180 - int(existed_sec)
+            insert_sec = need_sec if duration_sec is None else max(duration_sec, need_sec)
+
+            sess_start_jst = datetime.combine(tgt_date, time(12, 0), tzinfo=TimeMgr.JST)
+            sess_end_jst = sess_start_jst + timedelta(seconds=insert_sec)
+            sess_start_utc = sess_start_jst.astimezone(TimeMgr.UTC)
+            sess_end_utc = sess_end_jst.astimezone(TimeMgr.UTC)
+
+            try:
+                await DBH.execQuery(
+                    self.bot.db,
+                    self.bot.db_lock,
+                    """
+                    INSERT INTO voice_session_logs_reward
+                        (user_id, channel_id, session_start, session_end, duration)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        mem.id,
+                        channel_id,
+                        Util.dtStr(sess_start_utc),
+                        Util.dtStr(sess_end_utc),
+                        insert_sec,
+                    ),
+                )
+                logging.info(
+                    f"[adm_add_attendance] uid={mem.id} {tgt_date=} existing={int(existed_sec)}s + {insert_sec}s"
+                )
+                success += 1
+            except Exception:
+                logging.exception("Failed to insert dummy attendance session.")
+
+        if success == 0:
+            await interaction.followup.send("補填対象がありません。", ephemeral=True)
+        else:
+            if member is not None:
+                await interaction.followup.send(
+                    f"✅ {member.mention} の {tgt_date} を {insert_sec} 秒分補填しました",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    f"✅ {tgt_date} を {success} 名分補填しました。",
+                    ephemeral=True,
+                )
 
     # --- 皆勤賞デバッグコマンド (当月 / 前月対応版) -----------------------
     @app_commands.command(name="adm_check_attendance")
