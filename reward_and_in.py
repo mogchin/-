@@ -1139,11 +1139,28 @@ class AwardCalc:
 
         # ---------- Top3 ヘルパ ----------
         def _top3(src: Dict[int, float]) -> Dict[str, list]:
+            """Return top 3 users per gender, limiting ties to at most 3 names."""
             res = {"male": [], "female": []}
+            gender_map = {"male": [], "female": []}
             for uid, v in src.items():
                 sex = getSex(guild.get_member(uid))
                 if sex in ("male", "female"):
-                    AwardCalc.upd_award_top3(res[sex], uid, v)
+                    gender_map[sex].append((uid, v))
+
+            for sex, lst in gender_map.items():
+                lst.sort(key=lambda t: (-t[1], t[0]))
+                user_count = 0
+                for uid, val in lst:
+                    if user_count >= 3:
+                        break
+                    if res[sex] and res[sex][-1]["value"] == val:
+                        res[sex][-1]["users"].append(uid)
+                    else:
+                        if len(res[sex]) == 3:
+                            break
+                        res[sex].append({"value": val, "users": [uid]})
+                    user_count += 1
+
             return res
 
         # ========== 皆勤賞 ==========
